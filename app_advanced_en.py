@@ -1,0 +1,181 @@
+import streamlit as st
+import pandas as pd
+import time
+from typing import Optional
+from sentence_transformers import SentenceTransformer
+import faiss
+from dotenv import load_dotenv
+import numpy as np
+import google.generativeai as genai
+import os
+
+# 🔐 Load Gemini API key from environment variables
+load_dotenv()
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+
+# 🚀 Data: The American Revolution Text
+american_revolution_text = """The American Revolution was a pivotal event that took place between 1765 and 1783, when the thirteen American colonies rebelled against British rule. Fueled by Enlightenment ideas and a desire for self-governance, leaders such as George Washington, Thomas Jefferson, and Benjamin Franklin played significant roles in the struggle for independence. Key battles like the Battle of Saratoga and the Siege of Yorktown served as turning points in the war, ultimately leading to the formation of a new nation and setting a precedent for democratic governance worldwide."""
+
+# 🧱 Text chunking
+def chunk_text(text: str, chunk_size: int = 40):
+    sentences = text.split('. ')
+    chunks, chunk = [], []
+    for sentence in sentences:
+        chunk.append(sentence)
+        if len(' '.join(chunk).split()) >= chunk_size:
+            chunks.append(' '.join(chunk))
+            chunk = []
+    if chunk:
+        chunks.append(' '.join(chunk))
+    return chunks
+
+# 📦 FAISS-based Vector Store
+class VectorStore:
+    def __init__(self, model_name='sentence-transformers/all-MiniLM-L6-v2'):
+        self.model = SentenceTransformer(model_name)
+        self.index = None
+        self.texts = []
+
+    def build_index(self, chunks):
+        self.texts = chunks
+        embeddings = self.model.encode(chunks)
+        self.index = faiss.IndexFlatL2(embeddings.shape[1])
+        self.index.add(np.array(embeddings))
+
+    def retrieve(self, query, top_k=1):
+        query_vec = self.model.encode([query])
+        D, I = self.index.search(query_vec, top_k)
+        return [self.texts[i] for i in I[0]], D[0].tolist()
+
+# 🤖 Gemini generation wrapper
+def generate_answer(prompt: str) -> str:
+    model = genai.GenerativeModel(model_name='models/gemini-2.0-flash')
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+# 🧠 RAG Pipeline with variation modes
+def advanced_rag_pipeline(query: str, retriever: VectorStore,
+                          variation_type: str = "baseline",
+                          module_name: Optional[str] = None,
+                          prompt_style: Optional[str] = None) -> str:
+    if variation_type == "baseline":
+        chunks, _ = retriever.retrieve(query)
+    elif variation_type == "module":
+        if module_name == "hybrid":
+            chunks_dense, _ = retriever.retrieve(query)
+            chunks_keyword = [c for c in retriever.texts if any(w in c.lower() for w in query.lower().split())]
+            chunks = list(set(chunks_dense + chunks_keyword))[:1]
+        elif module_name == "rerank":
+            candidates, _ = retriever.retrieve(query, top_k=3)
+            chunks = sorted(candidates, key=lambda x: len(x.split()), reverse=True)[:1]
+        elif module_name == "metadata":
+            chunks = [c for c in retriever.texts if "American" in c or "Revolution" in c][:1]
+        else:
+            raise ValueError(f"Invalid module: {module_name}")
+    elif variation_type == "prompt":
+        chunks, _ = retriever.retrieve(query)
+    else:
+        raise ValueError(f"Invalid variation: {variation_type}")
+
+    context = chunks[0]
+    base_prompt = f"Context: {context}\\n\\nQuestion: {query}\\nAnswer:"
+    if variation_type == "prompt":
+        if prompt_style == "cot":
+            prompt = f"{base_prompt}\\nPlease explain step by step."
+        elif prompt_style == "role":
+            prompt = f"You are a historian specializing in the American Revolution. {base_prompt}"
+        elif prompt_style == "format":
+            prompt = f"{base_prompt}\\nProvide the answer in bullet points."
+        else:
+            raise ValueError(f"Invalid prompt style: {prompt_style}")
+    else:
+        prompt = base_prompt
+
+    return generate_answer(prompt)
+
+# 🧪 Simulated RAGA metrics
+def simulate_faithfulness(context, answer):
+    match = sum(1 for word in answer.split() if word in context)
+    return round(match / max(len(answer.split()), 1), 2)
+
+def simulate_answer_relevance(question, answer):
+    match = sum(1 for word in question.split() if word in answer)
+    return round(match / max(len(question.split()), 1), 2)
+
+def simulate_context_precision(context):
+    length = len(context.split())
+    return round(max(0.3, 1.0 - (length / 100)), 2)
+
+# 🧠 LLM evaluation (optional)
+def evaluate_with_llm(question: str, context: str, answer: str) -> str:
+    prompt = (
+        "You are an evaluator. Below is a response generated by a RAG system.\\n\\n"
+        f"Context: {context}\\n"
+        f"Question: {question}\\n"
+        f"Answer: {answer}\\n\\n"
+        "Please evaluate the answer based on:\\n"
+        "1. Relevance to the question\\n"
+        "2. Faithfulness to the context (any hallucinations?)\\n"
+        "3. Clarity and structure\\n\\n"
+        "Write a short summary:"
+    )
+    return generate_answer(prompt)
+
+# 🚀 Streamlit UI
+st.set_page_config(page_title="RAG Evaluation App", layout="wide")
+st.title("🔍 RAG Evaluation App")
+st.markdown("Compare different module and prompt techniques in a Gemini-powered RAG system using historical context from the American Revolution.")
+
+question = st.text_input("Enter your question:", placeholder="e.g. What were the causes of the American Revolution?")
+if question:
+    st.info("Generating answers...")
+    # Use the new dataset text instead of the previous Mars text
+    chunks = chunk_text(american_revolution_text)
+    vs = VectorStore()
+    vs.build_index(chunks)
+
+    configs = [
+        {"variation_type": "baseline", "module_name": None, "prompt_style": None},
+        {"variation_type": "module", "module_name": "hybrid", "prompt_style": None},
+        {"variation_type": "module", "module_name": "rerank", "prompt_style": None},
+        {"variation_type": "module", "module_name": "metadata", "prompt_style": None},
+        {"variation_type": "prompt", "module_name": None, "prompt_style": "cot"},
+        {"variation_type": "prompt", "module_name": None, "prompt_style": "role"}
+    ]
+
+    results = []
+    for config in configs:
+        answer = advanced_rag_pipeline(
+            query=question,
+            retriever=vs,
+            variation_type=config["variation_type"],
+            module_name=config["module_name"],
+            prompt_style=config["prompt_style"]
+        )
+        context = vs.retrieve(question)[0][0]
+        row = {
+            "variation_type": config["variation_type"],
+            "module_name": config["module_name"],
+            "prompt_style": config["prompt_style"],
+            "context": context,
+            "answer": answer,
+            "faithfulness": simulate_faithfulness(context, answer),
+            "answer_relevance": simulate_answer_relevance(question, answer),
+            "context_precision": simulate_context_precision(context)
+        }
+        results.append(row)
+        time.sleep(1.5)
+
+    df = pd.DataFrame(results)
+    st.subheader("📊 Evaluation Results")
+    st.dataframe(df[["variation_type", "module_name", "prompt_style", "answer", 
+                     "faithfulness", "answer_relevance", "context_precision"]])
+
+    if st.checkbox("💬 Show LLM evaluations"):
+        st.subheader("🧠 LLM Comments")
+        for row in results:
+            with st.expander(f"{row['variation_type']} | {row['module_name']} | {row['prompt_style']}"):
+                st.write(evaluate_with_llm(question, row["context"], row["answer"]))
